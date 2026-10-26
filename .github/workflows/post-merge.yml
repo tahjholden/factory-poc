@@ -2,9 +2,11 @@ name: post-merge
 on:
   push:
     branches: [main]
+  workflow_dispatch: # also fired by auto-revert after the revert lands (GITHUB_TOKEN merges do not emit push workflows)
 concurrency: post-merge-${{ github.ref }}
 jobs:
   gates:
+    if: ${{ github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions: { contents: read }
@@ -24,7 +26,7 @@ jobs:
   # Causality: re-run the gates on the parent commit (read-only). Only revert if the parent is green.
   parent-check:
     needs: gates
-    if: ${{ always() && needs.gates.result != 'success' }}
+    if: ${{ always() && github.ref == 'refs/heads/main' && needs.gates.result != 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions: { contents: read }
@@ -47,9 +49,9 @@ jobs:
   # Executes NO repository code: only git revert + gh.
   auto-revert:
     needs: [gates, parent-check]
-    if: ${{ always() && needs.gates.result != 'success' }}
+    if: ${{ always() && github.ref == 'refs/heads/main' && needs.gates.result != 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     permissions:
       contents: write
       pull-requests: write
@@ -90,3 +92,9 @@ jobs:
           gh workflow run ci.yml --ref "$branch"
           gh pr merge "$url" --auto --squash
           if [ -n "$orig" ]; then gh pr comment "$orig" --body "Post-merge gate failed on $sha. Auto-revert PR: $url"; fi
+          # A merge performed by GITHUB_TOKEN emits no push event, so re-verify main explicitly once the revert lands.
+          for _ in $(seq 1 60); do
+            [ "$(gh pr view "$url" --json state --jq .state)" = MERGED ] && { gh workflow run post-merge.yml --ref main; echo "re-verification of main dispatched" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
+            sleep 15
+          done
+          echo "revert PR not merged within 15 min; needs a human" >> "$GITHUB_STEP_SUMMARY"; exit 1
