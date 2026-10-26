@@ -3,12 +3,24 @@ on:
   pull_request:
   push:
     branches: [main]
-  workflow_dispatch: # lets post-merge run the required check on token-created revert PR branches
+  workflow_dispatch: # stand-in so the required check can run on token-created revert PR branches
+permissions:
+  contents: read
 jobs:
   verify:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
+      - name: Guard manual dispatch (revert/* branches by github-actions[bot] only)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          REF: ${{ github.ref }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          case "$REF" in refs/heads/revert/*) ;; *) echo "dispatch only allowed on revert/*"; exit 1;; esac
+          [ "$ACTOR" = "github-actions[bot]" ] || { echo "dispatch only allowed for github-actions[bot]"; exit 1; }
       - uses: actions/checkout@v4
+        with: { persist-credentials: false }
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with: { node-version: 24, cache: pnpm }

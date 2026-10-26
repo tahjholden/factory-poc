@@ -2,16 +2,15 @@ name: post-merge
 on:
   push:
     branches: [main]
-permissions:
-  contents: write
-  pull-requests: write
-  actions: write
 concurrency: post-merge-${{ github.ref }}
 jobs:
   gates:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions: { contents: read }
     steps:
       - uses: actions/checkout@v4
+        with: { persist-credentials: false }
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with: { node-version: 24, cache: pnpm }
@@ -22,34 +21,72 @@ jobs:
       - name: Summary
         run: echo "post-merge gates green at ${GITHUB_SHA}" >> "$GITHUB_STEP_SUMMARY"
 
-  auto-revert:
+  # Causality: re-run the gates on the parent commit (read-only). Only revert if the parent is green.
+  parent-check:
     needs: gates
-    if: ${{ always() && needs.gates.result == 'failure' }}
+    if: ${{ always() && needs.gates.result != 'success' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions: { contents: read }
+    outputs:
+      green: ${{ steps.out.outputs.green }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 2, persist-credentials: false }
+      - run: git checkout -q HEAD^
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 24, cache: pnpm }
+      - id: g
+        continue-on-error: true
+        run: pnpm install --frozen-lockfile && pnpm test && pnpm check && scripts/main-gate.sh
+      - id: out
+        env: { OUTCOME: "${{ steps.g.outcome }}" }
+        run: echo "green=$([ "$OUTCOME" = success ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+  # Executes NO repository code: only git revert + gh.
+  auto-revert:
+    needs: [gates, parent-check]
+    if: ${{ always() && needs.gates.result != 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: write
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PARENT_GREEN: ${{ needs.parent-check.outputs.green }}
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
-      - name: Revert culprit and open auto-merging PR
+      - name: Revert culprit (or escalate to an issue)
         run: |
           set -euo pipefail
           sha="$GITHUB_SHA"
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           subject="$(git log -1 --format=%s "$sha")"
-          # loop guard: never revert a revert
-          case "$subject" in revert:*|Revert*) echo "culprit is itself a revert; needs a human" >> "$GITHUB_STEP_SUMMARY"; exit 1;; esac
+          issue() { gh issue create --label factory --title "$1" --body "$2 Culprit: $sha. Run: $run_url" | tee -a "$GITHUB_STEP_SUMMARY"; exit 0; }
+          # already-a-revert: authoritative metadata (trailer or bot author), not the subject
+          if git log -1 --format=%B "$sha" | grep -q '^Factory-Auto-Revert:' || [ "$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha" --jq '.author.login // ""')" = "github-actions[bot]" ]; then
+            issue "auto-revert refused: culprit is itself an auto-revert" "Needs a human."
+          fi
+          n="$(git log origin/main --since='24 hours ago' --grep='^Factory-Auto-Revert:' --format=%H | wc -l | tr -d ' ')"
+          if [ "$n" -ge 3 ]; then issue "auto-revert circuit breaker tripped" "$n auto-reverts on main in 24h."; fi
+          if [ "${PARENT_GREEN:-}" != "true" ]; then issue "auto-revert skipped: parent commit is also red (or unverified)" "Main was broken before this commit."; fi
           git config user.name "factory-bot"; git config user.email "factory-bot@users.noreply.github.com"
           branch="revert/${sha:0:7}"
           git checkout -b "$branch"
           git revert --no-edit "$sha"
-          git commit --amend -q -m "revert: $subject" -m "Automatic revert of $sha (post-merge gate failure, run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)."
+          git commit --amend -q -m "revert: $subject" -m "Automatic revert of $sha (post-merge gate failure, run $run_url)."
           git push origin "$branch"
           orig="$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/pulls" --jq '.[0].number // empty')"
-          body="Automatic revert of $sha after post-merge gate failure.\n\nRun: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID\nOriginal PR: #${orig:-unknown}\n\n## Outcome\nRestore green main.\n## Evidence (tests run)\nrequired check dispatched via workflow_dispatch on this branch.\n## Rollback\nRevert this PR."
-          url="$(gh pr create --base main --head "$branch" --title "revert: $subject" --body "$(printf "$body")" --label risk:low --label factory)"
+          printf '%s\n' "Automatic revert of $sha after post-merge gate failure." "Run: $run_url" "Original PR: #${orig:-unknown}" "" "## Outcome" "Restore green main." "## Evidence (tests run)" "Parent commit verified green; required check dispatched on this branch." "## Rollback" "Revert this PR." "" "Factory-Auto-Revert: $sha" > /tmp/body.md
+          url="$(gh pr create --base main --head "$branch" --title "revert: $subject" --body-file /tmp/body.md --label risk:low --label factory)"
           echo "revert PR: $url" >> "$GITHUB_STEP_SUMMARY"
-          # GITHUB_TOKEN-created PRs do not fire pull_request workflows; a workflow_dispatch run on the
-          # branch does attach a check run named 'verify' to the branch head, satisfying branch protection.
+          # Stand-in: GITHUB_TOKEN PRs do not (reliably) get pull_request checks; dispatch ci.yml on the branch
+          # so a 'verify' check run attaches to the head SHA. ci.yml guards this to revert/* + github-actions[bot].
           gh workflow run ci.yml --ref "$branch"
           gh pr merge "$url" --auto --squash
           if [ -n "$orig" ]; then gh pr comment "$orig" --body "Post-merge gate failed on $sha. Auto-revert PR: $url"; fi
