@@ -1,0 +1,55 @@
+name: post-merge
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+concurrency: post-merge-${{ github.ref }}
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 24, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test
+      - run: pnpm check
+      - run: scripts/main-gate.sh
+      - name: Summary
+        run: echo "post-merge gates green at ${GITHUB_SHA}" >> "$GITHUB_STEP_SUMMARY"
+
+  auto-revert:
+    needs: gates
+    if: ${{ always() && needs.gates.result == 'failure' }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Revert culprit and open auto-merging PR
+        run: |
+          set -euo pipefail
+          sha="$GITHUB_SHA"
+          subject="$(git log -1 --format=%s "$sha")"
+          # loop guard: never revert a revert
+          case "$subject" in revert:*|Revert*) echo "culprit is itself a revert; needs a human" >> "$GITHUB_STEP_SUMMARY"; exit 1;; esac
+          git config user.name "factory-bot"; git config user.email "factory-bot@users.noreply.github.com"
+          branch="revert/${sha:0:7}"
+          git checkout -b "$branch"
+          git revert --no-edit "$sha"
+          git commit --amend -q -m "revert: $subject" -m "Automatic revert of $sha (post-merge gate failure, run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)."
+          git push origin "$branch"
+          orig="$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/pulls" --jq '.[0].number // empty')"
+          body="Automatic revert of $sha after post-merge gate failure.\n\nRun: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID\nOriginal PR: #${orig:-unknown}\n\n## Outcome\nRestore green main.\n## Evidence (tests run)\nrequired check dispatched via workflow_dispatch on this branch.\n## Rollback\nRevert this PR."
+          url="$(gh pr create --base main --head "$branch" --title "revert: $subject" --body "$(printf "$body")" --label risk:low --label factory)"
+          echo "revert PR: $url" >> "$GITHUB_STEP_SUMMARY"
+          # GITHUB_TOKEN-created PRs do not fire pull_request workflows; a workflow_dispatch run on the
+          # branch does attach a check run named 'verify' to the branch head, satisfying branch protection.
+          gh workflow run ci.yml --ref "$branch"
+          gh pr merge "$url" --auto --squash
+          if [ -n "$orig" ]; then gh pr comment "$orig" --body "Post-merge gate failed on $sha. Auto-revert PR: $url"; fi

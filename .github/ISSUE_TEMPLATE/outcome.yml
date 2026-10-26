@@ -1,0 +1,22 @@
+name: Outcome
+description: Request an outcome for the agent factory
+labels: [factory]
+body:
+  - type: textarea
+    id: outcome
+    attributes: { label: Outcome }
+    validations: { required: true }
+  - type: textarea
+    id: constraints
+    attributes: { label: Constraints }
+  - type: textarea
+    id: acceptance
+    attributes: { label: Acceptance criteria }
+    validations: { required: true }
+  - type: dropdown
+    id: risk
+    attributes: { label: Risk class, options: [risk:low, risk:medium, risk:high] }
+    validations: { required: true }
+  - type: textarea
+    id: capabilities
+    attributes: { label: Related capabilities }
