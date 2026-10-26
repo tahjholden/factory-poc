@@ -1,8 +1,9 @@
 name: ci
 on:
-  pull_request:
+  # push on all branches (no pull_request: bot-created PRs get held in action_required). strict protection forces the
+  # branch to contain main's head, so testing the branch head equals testing the merge result.
   push:
-    branches: [main]
+    branches: ['**']
   workflow_dispatch: # stand-in so the required check can run on token-created revert PR branches
 permissions:
   contents: read
