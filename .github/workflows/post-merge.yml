@@ -58,12 +58,38 @@ jobs:
       issues: write
       actions: write
     env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       PARENT_GREEN: ${{ needs.parent-check.outputs.green }}
     steps:
+      # Bot identity: with the factory GitHub App installed, the revert push and PR come from the app,
+      # so GitHub runs `verify` on the revert branch like any other push and the PR can auto-merge.
+      # Without the app secrets this falls back to GITHUB_TOKEN plus the dispatch stand-in (which GitHub
+      # does not count toward the required check; proven in E5 scenario 4).
+      - name: Detect factory app secrets
+        id: have
+        env:
+          APP_ID: ${{ secrets.FACTORY_APP_ID }}
+          APP_KEY: ${{ secrets.FACTORY_APP_PRIVATE_KEY }}
+        run: |
+          if [ -n "$APP_ID" ] && [ -n "$APP_KEY" ]; then echo "app=true" >> "$GITHUB_OUTPUT"; else echo "app=false" >> "$GITHUB_OUTPUT"; fi
+      - name: Mint factory app token (one hour, this repo, contents + pull requests only)
+        id: app
+        if: steps.have.outputs.app == 'true'
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.FACTORY_APP_ID }}
+          private-key: ${{ secrets.FACTORY_APP_PRIVATE_KEY }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
       - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+        with:
+          fetch-depth: 0
+          persist-credentials: false
       - name: Revert culprit (or escalate to an issue)
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
+          APP_IDENTITY: ${{ steps.have.outputs.app }}
+          BOT_LOGIN: ${{ steps.app.outputs.app-slug && format('{0}[bot]', steps.app.outputs.app-slug) || 'github-actions[bot]' }}
         run: |
           set -euo pipefail
           sha="$GITHUB_SHA"
@@ -71,7 +97,7 @@ jobs:
           subject="$(git log -1 --format=%s "$sha")"
           issue() { gh issue create --label factory --title "$1" --body "$2 Culprit: $sha. Run: $run_url" | tee -a "$GITHUB_STEP_SUMMARY"; exit 0; }
           # already-a-revert: authoritative metadata (trailer or bot author), not the subject
-          if git log -1 --format=%B "$sha" | grep -q '^Factory-Auto-Revert:' || [ "$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha" --jq '.author.login // ""')" = "github-actions[bot]" ]; then
+          if git log -1 --format=%B "$sha" | grep -q '^Factory-Auto-Revert:' || [ "$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha" --jq '.author.login // ""')" = "$BOT_LOGIN" ]; then
             issue "auto-revert refused: culprit is itself an auto-revert" "Needs a human."
           fi
           n="$(git log origin/main --since='24 hours ago' --grep='^Factory-Auto-Revert:' --format=%H | wc -l | tr -d ' ')"
@@ -81,20 +107,20 @@ jobs:
           branch="revert/${sha:0:7}"
           git checkout -b "$branch"
           git revert --no-edit "$sha"
-          git commit --amend -q -m "revert: $subject" -m "Automatic revert of $sha (post-merge gate failure, run $run_url)."
-          git push origin "$branch"
+          git commit --amend -q -m "revert: $subject" -m "Automatic revert of $sha (post-merge gate failure, run $run_url)." -m "Factory-Auto-Revert: $sha"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$branch"
           orig="$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/pulls" --jq '.[0].number // empty')"
           printf '%s\n' "Automatic revert of $sha after post-merge gate failure." "Run: $run_url" "Original PR: #${orig:-unknown}" "" "## Outcome" "Restore green main." "## Evidence (tests run)" "Parent commit verified green; required check dispatched on this branch." "## Rollback" "Revert this PR." "" "Factory-Auto-Revert: $sha" > /tmp/body.md
           url="$(gh pr create --base main --head "$branch" --title "revert: $subject" --body-file /tmp/body.md --label risk:low --label factory)"
           echo "revert PR: $url" >> "$GITHUB_STEP_SUMMARY"
           # Stand-in: GITHUB_TOKEN PRs do not (reliably) get pull_request checks; dispatch ci.yml on the branch
           # so a 'verify' check run attaches to the head SHA. ci.yml guards this to revert/* + github-actions[bot].
-          gh workflow run ci.yml --ref "$branch"
+          [ "$APP_IDENTITY" = true ] || gh workflow run ci.yml --ref "$branch"
           gh pr merge "$url" --auto --squash
           if [ -n "$orig" ]; then gh pr comment "$orig" --body "Post-merge gate failed on $sha. Auto-revert PR: $url"; fi
           # A merge performed by GITHUB_TOKEN emits no push event, so re-verify main explicitly once the revert lands.
           for _ in $(seq 1 60); do
-            [ "$(gh pr view "$url" --json state --jq .state)" = MERGED ] && { gh workflow run post-merge.yml --ref main; echo "re-verification of main dispatched" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
+            [ "$(gh pr view "$url" --json state --jq .state)" = MERGED ] && { [ "$APP_IDENTITY" = true ] || gh workflow run post-merge.yml --ref main; echo "revert landed (re-verification: ${APP_IDENTITY:+push event}${APP_IDENTITY:-dispatched})" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
             sleep 15
           done
           echo "revert PR not merged within 15 min; needs a human" >> "$GITHUB_STEP_SUMMARY"; exit 1
