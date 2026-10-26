@@ -1,1 +1,1 @@
-export const sum = (a, b) => b + a; // variant B
+export const sum = (a, b) => a + b; // variants A+B resolved
